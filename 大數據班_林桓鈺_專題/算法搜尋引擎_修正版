@@ -1,0 +1,264 @@
+# -*- coding: utf-8 -*-
+from collections import Counter, defaultdict
+from itertools import combinations
+from pathlib import Path
+import re
+
+import pandas as pd
+
+try:
+    from mlxtend.frequent_patterns import apriori
+    from mlxtend.preprocessing import TransactionEncoder
+except ModuleNotFoundError:
+    apriori = None
+    TransactionEncoder = None
+
+
+CURRENT_DIR = Path(__file__).resolve().parent
+ORIGINAL_PROJECT_DIR = Path(r"C:\Users\user\OneDrive\桌面\大數據隨身碟\29_林桓鈺_專題(最終)")
+BASE_DIR = CURRENT_DIR
+if not (BASE_DIR / "生成資料處裡" / "生成資料.xlsx").exists() and ORIGINAL_PROJECT_DIR.exists():
+    BASE_DIR = ORIGINAL_PROJECT_DIR
+PRODUCT_PATH = BASE_DIR / "生成資料處裡" / "生成資料.xlsx"
+COLOR_WEIGHT_PATH = BASE_DIR / "加權方式" / "顏色加權.xlsx"
+BRAND_WEIGHT_PATH = BASE_DIR / "加權方式" / "品牌加權.xlsx"
+
+# 測試用市場籃資料。若有真實訂單資料，建議改成從 Excel/CSV 讀取。
+TRANSACTIONS = [
+    ["NIKE", "CONVERSE", "ADIDAS"],
+    ["NIKE", "NEW BALANCE"],
+    ["CONVERSE", "ADIDAS"],
+    ["NIKE", "NEW BALANCE", "ADIDAS", "FILA"],
+    ["CONVERSE", "ADIDAS", "NEW BALANCE"],
+]
+
+
+def normalize_text(value):
+    """統一轉成大寫字串，方便中英文搜尋與比對。"""
+    if pd.isna(value):
+        return ""
+    return str(value).strip().upper()
+
+
+def split_keywords(query):
+    return [word for word in re.split(r"\s+", str(query).strip()) if word]
+
+
+def load_excel(path, required_columns):
+    df = pd.read_excel(path)
+    missing = [column for column in required_columns if column not in df.columns]
+    if missing:
+        raise ValueError(f"{path} 缺少欄位: {', '.join(missing)}")
+    return df
+
+
+def load_data():
+    products = load_excel(PRODUCT_PATH, ["name", "brand", "link", "price", "color"])
+    color_weights = load_excel(COLOR_WEIGHT_PATH, ["color", "加權"])
+    brand_weights = load_excel(BRAND_WEIGHT_PATH, ["brand", "加權"])
+
+    products = products.copy()
+    products["name"] = products["name"].fillna("").astype(str)
+    products["brand"] = products["brand"].fillna("").astype(str).str.strip()
+    products["color"] = products["color"].fillna("").astype(str).str.strip()
+
+    color_weights = color_weights.copy()
+    color_weights["color"] = color_weights["color"].fillna("").astype(str).str.strip()
+    color_weights["加權"] = pd.to_numeric(color_weights["加權"], errors="coerce").fillna(0)
+
+    brand_weights = brand_weights.copy()
+    brand_weights["brand"] = brand_weights["brand"].fillna("").astype(str).str.strip()
+    brand_weights["加權"] = pd.to_numeric(brand_weights["加權"], errors="coerce").fillna(0)
+
+    return products, color_weights, brand_weights
+
+
+def build_brand_associations(transactions, min_support=0.4):
+    cleaned_transactions = [
+        sorted({normalize_text(item) for item in transaction if normalize_text(item)})
+        for transaction in transactions
+    ]
+
+    if not cleaned_transactions:
+        return pd.DataFrame(columns=["brand", "related_brand", "support"])
+
+    if apriori is not None and TransactionEncoder is not None:
+        encoder = TransactionEncoder()
+        encoded = encoder.fit(cleaned_transactions).transform(cleaned_transactions)
+        basket_df = pd.DataFrame(encoded, columns=encoder.columns_)
+        frequent_itemsets = apriori(basket_df, min_support=min_support, use_colnames=True)
+
+        rows = []
+        for _, row in frequent_itemsets.iterrows():
+            items = sorted(row["itemsets"])
+            if len(items) < 2:
+                continue
+            for brand_a, brand_b in combinations(items, 2):
+                rows.append(
+                    {"brand": brand_a, "related_brand": brand_b, "support": row["support"]}
+                )
+                rows.append(
+                    {"brand": brand_b, "related_brand": brand_a, "support": row["support"]}
+                )
+        return pd.DataFrame(rows, columns=["brand", "related_brand", "support"])
+
+    pair_counts = Counter()
+    for transaction in cleaned_transactions:
+        for brand_a, brand_b in combinations(transaction, 2):
+            pair_counts[(brand_a, brand_b)] += 1
+
+    rows = []
+    total = len(cleaned_transactions)
+    for (brand_a, brand_b), count in pair_counts.items():
+        support = count / total
+        if support < min_support:
+            continue
+        rows.append({"brand": brand_a, "related_brand": brand_b, "support": support})
+        rows.append({"brand": brand_b, "related_brand": brand_a, "support": support})
+    return pd.DataFrame(rows, columns=["brand", "related_brand", "support"])
+
+
+def exact_values_in_query(query, values):
+    query_norm = normalize_text(query)
+    matched = []
+    for value in values:
+        value_norm = normalize_text(value)
+        if value_norm and value_norm in query_norm:
+            matched.append(value)
+    return matched
+
+
+def build_query_weights(query, color_weights, brand_weights, associations):
+    keywords = split_keywords(query)
+    query_colors = exact_values_in_query(query, color_weights["color"])
+    query_brands = exact_values_in_query(query, brand_weights["brand"])
+
+    color_weights = color_weights.copy()
+    brand_weights = brand_weights.copy()
+
+    color_norm = color_weights["color"].map(normalize_text)
+    brand_norm = brand_weights["brand"].map(normalize_text)
+
+    for color in query_colors:
+        color_weights.loc[color_norm == normalize_text(color), "加權"] += 10
+
+    query_brand_norms = {normalize_text(brand) for brand in query_brands}
+    for brand in query_brand_norms:
+        brand_weights.loc[brand_norm == brand, "加權"] += 20
+
+    if not associations.empty and query_brand_norms:
+        related = set(
+            associations.loc[
+                associations["brand"].isin(query_brand_norms), "related_brand"
+            ].dropna()
+        )
+        for brand in related:
+            brand_weights.loc[brand_norm == normalize_text(brand), "加權"] += 10
+
+    return keywords, color_weights, brand_weights
+
+
+def keyword_search(query, documents):
+    results = {}
+    query_norm = normalize_text(query)
+    for doc_id, doc_text in documents.items():
+        if query_norm and query_norm in normalize_text(doc_text):
+            results[doc_id] = doc_text
+    return results
+
+
+def search_products(query, products):
+    keywords = split_keywords(query)
+    if not keywords:
+        return products.iloc[0:0].copy()
+
+    name_series = products["name"].fillna("").astype(str)
+    brand_norm = products["brand"].map(normalize_text)
+    color_norm = products["color"].map(normalize_text)
+
+    mask = pd.Series(False, index=products.index)
+    for keyword in keywords:
+        keyword_norm = normalize_text(keyword)
+        mask |= name_series.str.contains(keyword, case=False, regex=False, na=False)
+        mask |= brand_norm.str.contains(keyword_norm, regex=False, na=False)
+        mask |= color_norm.eq(keyword_norm)
+
+    return products.loc[mask].copy()
+
+
+def calculate_keyword_score(products, keywords):
+    scores = pd.Series(0, index=products.index, dtype=float)
+    name_series = products["name"].fillna("").astype(str)
+    brand_norm = products["brand"].map(normalize_text)
+    color_norm = products["color"].map(normalize_text)
+
+    for keyword in keywords:
+        keyword_norm = normalize_text(keyword)
+        scores += name_series.str.contains(keyword, case=False, regex=False, na=False).astype(int) * 5
+        scores += brand_norm.str.contains(keyword_norm, regex=False, na=False).astype(int) * 8
+        scores += color_norm.eq(keyword_norm).astype(int) * 8
+
+    return scores
+
+
+def rank_products(query, top_n=30):
+    keywords, color_weights, brand_weights = build_query_weights(
+        query, COLOR_WEIGHTS, BRAND_WEIGHTS, BRAND_ASSOCIATIONS
+    )
+    results = search_products(query, PRODUCTS)
+    if results.empty:
+        return results.assign(weighted=pd.Series(dtype=float))
+
+    color_scores = color_weights.rename(columns={"加權": "color_weight"})
+    brand_scores = brand_weights.rename(columns={"加權": "brand_weight"})
+
+    ranked = results.merge(color_scores, how="left", on="color")
+    ranked = ranked.merge(brand_scores, how="left", on="brand")
+    ranked["keyword_score"] = calculate_keyword_score(ranked, keywords).values
+    ranked["weighted"] = (
+        ranked["color_weight"].fillna(0)
+        + ranked["brand_weight"].fillna(0)
+        + ranked["keyword_score"].fillna(0)
+    )
+
+    ranked = ranked.drop_duplicates(subset=["link"], keep="first")
+    ranked = ranked.sort_values(
+        by=["weighted", "price"], ascending=[False, True], ignore_index=True
+    )
+    return ranked.head(top_n)
+
+
+# 保留原本函式名稱，方便舊程式呼叫。
+def search(x):
+    return search_products(x, PRODUCTS)
+
+
+def weighted(g):
+    return rank_products(g)
+
+
+def final(y):
+    return rank_products(y)
+
+
+def end(u):
+    columns = ["name", "brand", "color", "price", "link", "weighted"]
+    return rank_products(u)[columns]
+
+
+def ff(g):
+    return end(g)
+
+
+PRODUCTS, COLOR_WEIGHTS, BRAND_WEIGHTS = load_data()
+BRAND_ASSOCIATIONS = build_brand_associations(TRANSACTIONS)
+
+
+if __name__ == "__main__":
+    query = input("輸入搜尋物:").strip()
+    result = ff(query)
+
+    if result.empty:
+        print("找不到符合的商品。")
+    else:
+        print(result.to_string(index=False))
